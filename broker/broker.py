@@ -1,0 +1,1 @@
+# Broker server — handles incoming connections, subscription registry, and topic-based message routing.

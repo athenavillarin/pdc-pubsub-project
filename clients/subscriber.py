@@ -1,0 +1,1 @@
+# Subscriber client — connects to the broker, registers topic interest, and receives messages.

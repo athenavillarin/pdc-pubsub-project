@@ -1,0 +1,1 @@
+# Persistent queue — stores messages for offline subscribers and delivers them upon reconnection.

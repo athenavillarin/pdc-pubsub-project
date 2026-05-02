@@ -1,0 +1,1 @@
+# Demo scenario — stock alert system with 2 publishers and 3 subscribers across different topics.
