@@ -328,7 +328,7 @@ class BrokerServer:
 
 
 def main() -> None:
-	broker = BrokerServer()
+	broker = BrokerServer(host="127.0.0.1", port=9000)
 	broker.start()
 	print(f"Broker listening on {broker.host}:{broker.port}")
 	try:
