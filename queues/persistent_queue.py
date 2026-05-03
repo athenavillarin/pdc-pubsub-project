@@ -8,6 +8,7 @@ Scope in this file:
 
 from __future__ import annotations
 
+import uuid
 import json
 import os
 import threading
@@ -20,8 +21,11 @@ QUEUE_DIR = "queues"
 
 @dataclass
 class QueuedMessage:
+    message_id: str
     topic: str
     payload: str
+    attempts: int = 0
+    acked: bool = False
 
 
 class PersistentQueue:
@@ -57,8 +61,11 @@ class PersistentQueue:
                 try:
                     data = json.loads(line)
                     messages.append(QueuedMessage(
+                        message_id=str(data.get("message_id", "")),
                         topic=data["topic"],
                         payload=data["payload"],
+                        attempts=int(data.get("attempts", 0)),
+                        acked=bool(data.get("acked", False)),
                     ))
                 except (json.JSONDecodeError, KeyError):
                     continue
@@ -69,16 +76,47 @@ class PersistentQueue:
         path = self._path(subscriber_id)
         with open(path, "w", encoding="utf-8") as f:
             for msg in messages:
-                f.write(json.dumps({"topic": msg.topic, "payload": msg.payload}) + "\n")
+                f.write(
+                    json.dumps(
+                        {
+                            "message_id": msg.message_id,
+                            "topic": msg.topic,
+                            "payload": msg.payload,
+                            "attempts": msg.attempts,
+                            "acked": msg.acked,
+                        }
+                    )
+                    + "\n"
+                )
 
     # ── Public API ──────────────────────────────────────────────────────────
 
-    def enqueue(self, subscriber_id: str, topic: str, payload: str) -> None:
-        """Append a message to the subscriber's queue file."""
+    def enqueue(
+        self,
+        subscriber_id: str,
+        topic: str,
+        payload: str,
+        message_id: str | None = None,
+        attempts: int = 0,
+    ) -> str:
+        """Append a message to the subscriber's queue file and return its message id."""
+        message_id = message_id or str(uuid.uuid4())
         with self._lock:
             path = self._path(subscriber_id)
             with open(path, "a", encoding="utf-8") as f:
-                f.write(json.dumps({"topic": topic, "payload": payload}) + "\n")
+                f.write(
+                    json.dumps(
+                        {
+                            "message_id": message_id,
+                            "topic": topic,
+                            "payload": payload,
+                            "attempts": attempts,
+                            "acked": False,
+                        }
+                    )
+                    + "\n"
+                )
+        return message_id
 
     def flush(self, subscriber_id: str) -> list[QueuedMessage]:
         """Return all queued messages and clear the queue file."""
@@ -86,6 +124,27 @@ class PersistentQueue:
             messages = self._read_all(subscriber_id)
             self._write_all(subscriber_id, [])
         return messages
+
+    def fetch_pending(self, subscriber_id: str) -> list[QueuedMessage]:
+        """Return queued messages that have not been acknowledged yet."""
+        with self._lock:
+            return [message for message in self._read_all(subscriber_id) if not message.acked]
+
+    def mark_acked(self, subscriber_id: str, message_id: str) -> None:
+        """Mark a queued message acknowledged and remove it from the queue file."""
+        with self._lock:
+            messages = [message for message in self._read_all(subscriber_id) if message.message_id != message_id]
+            self._write_all(subscriber_id, messages)
+
+    def increment_attempt(self, subscriber_id: str, message_id: str) -> None:
+        """Increment the delivery attempts counter for a queued message."""
+        with self._lock:
+            messages = self._read_all(subscriber_id)
+            for message in messages:
+                if message.message_id == message_id:
+                    message.attempts += 1
+                    break
+            self._write_all(subscriber_id, messages)
 
     def peek(self, subscriber_id: str) -> list[QueuedMessage]:
         """Return all queued messages without clearing the queue."""

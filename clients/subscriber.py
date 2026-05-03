@@ -18,8 +18,6 @@ import sys
 import threading
 import time
 
-from queues.persistent_queue import PersistentQueue
-
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 9000
@@ -42,19 +40,18 @@ class Subscriber:
         topics: list[str],
         host: str = DEFAULT_HOST,
         port: int = DEFAULT_PORT,
-        queue: PersistentQueue | None = None,
     ) -> None:
         self.subscriber_id = subscriber_id
         self.topics = topics
         self.host = host
         self.port = port
-        self.queue = queue or PersistentQueue()
 
         self._sock: socket.socket | None = None
         self._reader = None
         self._running = threading.Event()
         self._heartbeat_thread: threading.Thread | None = None
         self._lock = threading.Lock()
+        self._send_lock = threading.Lock()
 
     # ── Connection ──────────────────────────────────────────────────────────
 
@@ -71,15 +68,23 @@ class Subscriber:
 
             # Register subscriptions
             self._send({"cmd": "subscribe", "subscriber_id": self.subscriber_id, "topics": self.topics})
-            response = self._recv()
-            if response.get("type") != "ok":
-                print(f"[{self.subscriber_id}] Subscribe failed: {response}")
-                return False
+
+            while True:
+                response = self._recv()
+                msg_type = response.get("type")
+
+                if msg_type == "deliver":
+                    self._handle_delivery(response)
+                    continue
+
+                if msg_type != "ok":
+                    print(f"[{self.subscriber_id}] Subscribe failed: {response}")
+                    return False
+
+                break
 
             print(f"[{self.subscriber_id}] Connected and subscribed to: {self.topics}")
 
-            # Flush any queued messages from when we were offline
-            self._flush_queue()
             return True
 
         except (ConnectionRefusedError, OSError) as e:
@@ -112,7 +117,8 @@ class Subscriber:
         if sock is None:
             raise ConnectionError("Not connected")
         data = (json.dumps(payload) + "\n").encode("utf-8")
-        sock.sendall(data)
+        with self._send_lock:
+            sock.sendall(data)
 
     def _recv(self) -> dict:
         """Read one JSON line from the broker."""
@@ -125,18 +131,23 @@ class Subscriber:
             raise ConnectionError("Broker closed the connection")
         return json.loads(line.strip())
 
-    def _flush_queue(self) -> None:
-        """Deliver any messages queued while offline, then clear the queue."""
-        messages = self.queue.flush(self.subscriber_id)
-        if messages:
-            print(f"[{self.subscriber_id}] Flushing {len(messages)} queued message(s) from disk:")
-            for msg in messages:
-                self._on_message(msg.topic, msg.payload, from_queue=True)
-
     def _on_message(self, topic: str, payload: str, from_queue: bool = False) -> None:
         """Handle a delivered message. Override or extend this for custom logic."""
         source = "QUEUE" if from_queue else "LIVE "
         print(f"[{self.subscriber_id}] [{source}] topic={topic!r} payload={payload!r}")
+
+    def _handle_delivery(self, message: dict) -> None:
+        topic = message.get("topic", "")
+        payload = message.get("payload", "")
+        message_id = message.get("message_id", "")
+        from_queue = bool(message.get("from_queue", False))
+
+        self._on_message(topic, payload, from_queue=from_queue)
+
+        try:
+            self._send({"cmd": "ack", "subscriber_id": self.subscriber_id, "message_id": message_id})
+        except (ConnectionError, OSError):
+            pass
 
     # ── Heartbeat ───────────────────────────────────────────────────────────
 
@@ -173,14 +184,7 @@ class Subscriber:
             msg_type = message.get("type")
 
             if msg_type == "deliver":
-                topic = message.get("topic", "")
-                payload = message.get("payload", "")
-
-                # Queue the message first (at-least-once: write before processing)
-                self.queue.enqueue(self.subscriber_id, topic, payload)
-                self._on_message(topic, payload)
-                # Clear from queue after successful processing
-                self.queue.flush(self.subscriber_id)
+                self._handle_delivery(message)
 
             elif msg_type == "error":
                 print(f"[{self.subscriber_id}] Broker error: {message.get('message')}")

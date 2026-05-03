@@ -13,9 +13,12 @@ import json
 import socket
 import threading
 import time
+import uuid
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any
+
+from queues.persistent_queue import PersistentQueue
 
 
 @dataclass
@@ -26,6 +29,17 @@ class ClientSession:
 	lock: threading.Lock = field(default_factory=threading.Lock)
 
 
+@dataclass
+class PendingDelivery:
+	subscriber_id: str
+	message_id: str
+	topic: str
+	payload: str
+	deadline: float
+	attempts: int = 1
+	persisted: bool = False
+
+
 class BrokerServer:
 	"""Broker that accepts subscribe/publish/heartbeat commands over TCP JSON lines."""
 
@@ -33,11 +47,13 @@ class BrokerServer:
 		self,
 		host: str = "127.0.0.1",
 		port: int = 0,
+		ack_timeout: float = 1.0,
 		heartbeat_timeout: float = 5.0,
 		maintenance_interval: float = 0.2,
 	) -> None:
 		self.host = host
 		self.port = port
+		self.ack_timeout = ack_timeout
 		self.heartbeat_timeout = heartbeat_timeout
 		self.maintenance_interval = maintenance_interval
 
@@ -47,6 +63,7 @@ class BrokerServer:
 		self._accept_thread: threading.Thread | None = None
 		self._maintenance_thread: threading.Thread | None = None
 		self._client_threads: set[threading.Thread] = set()
+		self.queue = PersistentQueue()
 
 		# Subscription registry
 		self.topic_subscribers: dict[str, set[str]] = defaultdict(set)
@@ -56,6 +73,7 @@ class BrokerServer:
 		self.subscriber_sessions: dict[str, ClientSession] = {}
 		self.online_status: dict[str, dict[str, Any]] = {}
 		self.conn_to_subscriber: dict[socket.socket, str] = {}
+		self.pending_acks: dict[tuple[str, str], PendingDelivery] = {}
 
 	def start(self) -> None:
 		if self._running.is_set():
@@ -177,6 +195,14 @@ class BrokerServer:
 			self._touch_subscriber(subscriber_id)
 			return {"type": "ok", "cmd": "heartbeat"}
 
+		if cmd == "ack":
+			subscriber_id = str(message.get("subscriber_id", "")).strip()
+			message_id = str(message.get("message_id", "")).strip()
+			if not subscriber_id or not message_id:
+				return {"type": "error", "message": "missing-ack-fields"}
+			self._handle_ack(subscriber_id, message_id)
+			return {"type": "ok", "cmd": "ack", "message_id": message_id}
+
 		return {"type": "error", "message": "unknown-command"}
 
 	def _handle_subscribe(
@@ -209,6 +235,17 @@ class BrokerServer:
 
 			self.online_status[subscriber_id] = {"online": True, "last_seen": time.time()}
 
+		queued_messages = self.queue.fetch_pending(subscriber_id)
+		for queued_message in queued_messages:
+			self._send_to_subscriber(
+				subscriber_id,
+				queued_message.topic,
+				queued_message.payload,
+				message_id=queued_message.message_id,
+				persisted=True,
+				duplicate=queued_message.attempts > 0,
+			)
+
 		return {
 			"type": "ok",
 			"cmd": "subscribe",
@@ -236,16 +273,27 @@ class BrokerServer:
 	def _route_message(self, topic: str, payload: str) -> int:
 		with self._lock:
 			subscribers = list(self.topic_subscribers.get(topic, set()))
+		message_id = str(uuid.uuid4())
 
 		routed = 0
 		for subscriber_id in subscribers:
 			if self.is_subscriber_online(subscriber_id):
-				ok = self._send_to_subscriber(subscriber_id, topic, payload)
+				ok = self._send_to_subscriber(subscriber_id, topic, payload, message_id=message_id, persisted=False)
 				if ok:
 					routed += 1
+			else:
+				self.queue.enqueue(subscriber_id, topic, payload, message_id=message_id)
 		return routed
 
-	def _send_to_subscriber(self, subscriber_id: str, topic: str, payload: str) -> bool:
+	def _send_to_subscriber(
+		self,
+		subscriber_id: str,
+		topic: str,
+		payload: str,
+		message_id: str,
+		persisted: bool,
+		duplicate: bool = False,
+	) -> bool:
 		with self._lock:
 			session = self.subscriber_sessions.get(subscriber_id)
 			if session is None:
@@ -253,14 +301,35 @@ class BrokerServer:
 
 		envelope = {
 			"type": "deliver",
+			"message_id": message_id,
 			"topic": topic,
 			"payload": payload,
+			"duplicate": duplicate,
+			"from_queue": persisted,
 		}
 		ok = self._send_json_session(session, envelope)
 		if not ok:
 			self._mark_offline(subscriber_id)
 			return False
+
+		with self._lock:
+			self.pending_acks[(subscriber_id, message_id)] = PendingDelivery(
+				subscriber_id=subscriber_id,
+				message_id=message_id,
+				topic=topic,
+				payload=payload,
+				deadline=time.time() + self.ack_timeout,
+				persisted=persisted,
+			)
+		if persisted:
+			self.queue.increment_attempt(subscriber_id, message_id)
 		return True
+
+	def _handle_ack(self, subscriber_id: str, message_id: str) -> None:
+		with self._lock:
+			pending = self.pending_acks.pop((subscriber_id, message_id), None)
+		if pending and pending.persisted:
+			self.queue.mark_acked(subscriber_id, message_id)
 
 	def _touch_subscriber(self, subscriber_id: str) -> None:
 		with self._lock:
@@ -284,6 +353,17 @@ class BrokerServer:
 			if session is not None:
 				self.conn_to_subscriber.pop(session.conn, None)
 
+			pending_keys = [key for key in self.pending_acks if key[0] == subscriber_id]
+			for key in pending_keys:
+				pending = self.pending_acks.pop(key)
+				if not pending.persisted:
+					self.queue.enqueue(
+						subscriber_id,
+						pending.topic,
+						pending.payload,
+						message_id=pending.message_id,
+					)
+
 		if session is not None:
 			try:
 				session.conn.shutdown(socket.SHUT_RDWR)
@@ -297,6 +377,7 @@ class BrokerServer:
 	def _maintenance_loop(self) -> None:
 		while self._running.is_set():
 			self._expire_heartbeats()
+			self._retry_expired_acks()
 			time.sleep(self.maintenance_interval)
 
 	def _expire_heartbeats(self) -> None:
@@ -308,6 +389,37 @@ class BrokerServer:
 					to_offline.append(subscriber_id)
 		for subscriber_id in to_offline:
 			self._mark_offline(subscriber_id)
+
+	def _retry_expired_acks(self) -> None:
+		now = time.time()
+		expired: list[PendingDelivery] = []
+		with self._lock:
+			for pending in self.pending_acks.values():
+				if pending.deadline <= now:
+					expired.append(pending)
+
+		for pending in expired:
+			with self._lock:
+				still_pending = self.pending_acks.get((pending.subscriber_id, pending.message_id))
+				if still_pending is None:
+					continue
+			if not self.is_subscriber_online(pending.subscriber_id):
+				continue
+
+			delivered = self._send_to_subscriber(
+				pending.subscriber_id,
+				pending.topic,
+				pending.payload,
+				message_id=pending.message_id,
+				persisted=pending.persisted,
+				duplicate=True,
+			)
+			if delivered:
+				with self._lock:
+					entry = self.pending_acks.get((pending.subscriber_id, pending.message_id))
+					if entry is not None:
+						entry.attempts += 1
+						entry.deadline = time.time() + self.ack_timeout
 
 	def _send_json_raw(self, conn: socket.socket, payload: dict[str, Any]) -> bool:
 		data = (json.dumps(payload) + "\n").encode("utf-8")
