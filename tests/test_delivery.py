@@ -46,6 +46,18 @@ def _restore_queues(queue_dir: str) -> None:
     shutil.rmtree(queue_dir, ignore_errors=True)
 
 
+def _read_two_ok_cmds(conn: socket.socket) -> set[str]:
+    cmds: set[str] = set()
+    for _ in range(2):
+        msg = _recv_json(conn, timeout=1.0)
+        assert msg is not None
+        assert msg["type"] == "ok"
+        cmd = str(msg.get("cmd", ""))
+        assert cmd in {"ack", "subscribe"}
+        cmds.add(cmd)
+    return cmds
+
+
 def test_ack_required_for_delivery() -> None:
     """Verify that messages include message_id and broker waits for ACK."""
     queue_dir = _clear_queues()
@@ -187,11 +199,58 @@ def test_message_replay_on_reconnection() -> None:
         except OSError:
             pass
         broker.stop()
-        persistent_queue.QUEUE_DIR = str(ROOT / "queues")
+        _restore_queues(queue_dir)
+
+
+def test_no_ack_then_disconnect_replayed_on_reconnect() -> None:
+    """Verify unacked live delivery is persisted and replayed after disconnect/reconnect."""
+    queue_dir = _clear_queues()
+    broker = BrokerServer(port=0, ack_timeout=0.4, heartbeat_timeout=2.0, maintenance_interval=0.1)
+    broker.start()
+    time.sleep(0.1)
+
+    sub_id = f"sub_{uuid.uuid4().hex[:8]}"
+    sub1 = socket.create_connection((broker.host, broker.port), timeout=2)
+    pub = socket.create_connection((broker.host, broker.port), timeout=2)
+
+    try:
+        _send_json(sub1, {"cmd": "subscribe", "subscriber_id": sub_id, "topics": ["test"]})
+        assert _recv_json(sub1)["type"] == "ok"
+
+        _send_json(pub, {"cmd": "publish", "topic": "test", "payload": "must-replay"})
+        assert _recv_json(pub)["type"] == "ok"
+
+        # Receive once, but intentionally do not ACK.
+        first = _recv_json(sub1, timeout=1.0)
+        assert first["type"] == "deliver"
+        assert first["payload"] == "must-replay"
+        message_id = first["message_id"]
+
+        # Disconnect before ACK; broker should persist this pending delivery.
+        sub1.close()
+        time.sleep(0.3)
+
+        sub2 = socket.create_connection((broker.host, broker.port), timeout=2)
+        _send_json(sub2, {"cmd": "subscribe", "subscriber_id": sub_id, "topics": ["test"]})
+
+        replay = _recv_json(sub2, timeout=1.0)
+        assert replay["type"] == "deliver"
+        assert replay["payload"] == "must-replay"
+        assert replay["message_id"] == message_id
+
+        # ACK replayed message to finish cleanly.
+        _send_json(sub2, {"cmd": "ack", "subscriber_id": sub_id, "message_id": message_id})
+        ok_cmds = _read_two_ok_cmds(sub2)
+        assert ok_cmds == {"ack", "subscribe"}
+
+        sub2.close()
+    finally:
         try:
-            Path(queue_dir).rmdir()
+            pub.close()
         except OSError:
             pass
+        broker.stop()
+        _restore_queues(queue_dir)
 
 
 def test_duplicate_flag_on_redelivery() -> None:
