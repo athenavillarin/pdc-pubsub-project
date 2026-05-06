@@ -1,3 +1,6 @@
 {"message_id": "4a62c415-6c60-47ed-ab5f-7cfc2c24e3e6", "topic": "stocks.tech", "payload": "AAPL=206", "attempts": 4, "acked": false}
 {"message_id": "b558a5ad-0587-4a10-979f-b91856855d77", "topic": "stocks.tech", "payload": "AAPL=205", "attempts": 1, "acked": false}
 {"message_id": "0ed08b59-161e-4884-938c-46a622e0e0c0", "topic": "stocks.tech", "payload": "AAPL=206", "attempts": 1, "acked": false}
+{"message_id": "c9c371cb-67a1-4055-8c0f-64907594d913", "topic": "alerts.high", "payload": "sale sale", "attempts": 0, "acked": false}
+{"message_id": "a998fefb-2de3-4a98-b04a-034d0af0a91b", "topic": "stocks.tech", "payload": "Pumaldo nanaman", "attempts": 0, "acked": false}
+{"message_id": "4b1d0033-078d-4860-9a16-3fb9f756059d", "topic": "stocks.tech", "payload": "Tech stocks are up 3.2% after strong earnings", "attempts": 0, "acked": false}

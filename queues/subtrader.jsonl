@@ -1,3 +1,2 @@
-{"message_id": "c9c371cb-67a1-4055-8c0f-64907594d913", "topic": "alerts.high", "payload": "sale sale", "attempts": 0, "acked": false}
 {"message_id": "a998fefb-2de3-4a98-b04a-034d0af0a91b", "topic": "stocks.tech", "payload": "Pumaldo nanaman", "attempts": 0, "acked": false}
 {"message_id": "4b1d0033-078d-4860-9a16-3fb9f756059d", "topic": "stocks.tech", "payload": "Tech stocks are up 3.2% after strong earnings", "attempts": 0, "acked": false}
