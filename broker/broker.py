@@ -11,12 +11,18 @@ from __future__ import annotations
 
 import json
 import socket
+import sys
 import threading
 import time
 import uuid
 from collections import defaultdict
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from queues.persistent_queue import PersistentQueue
 
@@ -47,7 +53,7 @@ class BrokerServer:
 		self,
 		host: str = "127.0.0.1",
 		port: int = 0,
-		ack_timeout: float = 1.0,
+		ack_timeout: float = 5.0,
 		heartbeat_timeout: float = 5.0,
 		maintenance_interval: float = 0.2,
 	) -> None:
@@ -135,27 +141,51 @@ class BrokerServer:
 			thread.start()
 
 	def _handle_connection(self, conn: socket.socket, addr: tuple[str, int]) -> None:
-		reader = conn.makefile("r", encoding="utf-8")
+		print(f"[BROKER] Connection from {addr}")
+		conn.settimeout(None)  # Set to blocking mode
+		buffer = b""
 		try:
 			while self._running.is_set():
-				line = reader.readline()
-				if not line:
-					break
 				try:
-					data = json.loads(line)
-				except json.JSONDecodeError:
-					self._send_json_raw(conn, {"type": "error", "message": "invalid-json"})
+					# Read available data from socket
+					print(f"[BROKER] Waiting for data from {addr}...", flush=True)
+					data = conn.recv(4096)
+					print(f"[BROKER] Received {len(data)} bytes from {addr}: {data[:100]}", flush=True)
+					if not data:
+						# Connection closed by client
+						print(f"[BROKER] EOF from {addr}", flush=True)
+						break
+					buffer += data
+				except socket.timeout:
 					continue
+				except (OSError, ConnectionResetError) as e:
+					print(f"[BROKER] Socket error from {addr}: {e}", flush=True)
+					break
 
-				response = self._dispatch(data, conn, addr)
-				if response is not None:
-					self._send_json_raw(conn, response)
+				# Process all complete lines in buffer
+				while b"\n" in buffer:
+					line, buffer = buffer.split(b"\n", 1)
+					line = line.strip()
+					if not line:
+						continue
+					
+					try:
+						message = json.loads(line.decode("utf-8"))
+						print(f"[BROKER] Parsed message from {addr}: {message}", flush=True)
+					except (json.JSONDecodeError, UnicodeDecodeError) as e:
+						print(f"[BROKER] JSON error from {addr}: {e}", flush=True)
+						self._send_json_raw(conn, {"type": "error", "message": "invalid-json"})
+						continue
+
+					print(f"[BROKER] Dispatching message from {addr}", flush=True)
+					response = self._dispatch(message, conn, addr)
+					if response is not None:
+						self._send_json_raw(conn, response)
+		except Exception as e:
+			print(f"[BROKER] Exception in _handle_connection: {e}", flush=True)
 		finally:
+			print(f"[BROKER] Closing connection from {addr}", flush=True)
 			self._cleanup_connection(conn)
-			try:
-				reader.close()
-			except OSError:
-				pass
 			try:
 				conn.close()
 			except OSError:
@@ -234,17 +264,6 @@ class BrokerServer:
 				self.subscriber_topics[subscriber_id].add(topic)
 
 			self.online_status[subscriber_id] = {"online": True, "last_seen": time.time()}
-
-		queued_messages = self.queue.fetch_pending(subscriber_id)
-		for queued_message in queued_messages:
-			self._send_to_subscriber(
-				subscriber_id,
-				queued_message.topic,
-				queued_message.payload,
-				message_id=queued_message.message_id,
-				persisted=True,
-				duplicate=queued_message.attempts > 0,
-			)
 
 		return {
 			"type": "ok",
@@ -340,8 +359,14 @@ class BrokerServer:
 	def _cleanup_connection(self, conn: socket.socket) -> None:
 		with self._lock:
 			subscriber_id = self.conn_to_subscriber.pop(conn, None)
-		if subscriber_id:
-			self._mark_offline(subscriber_id)
+			if not subscriber_id:
+				return
+
+			# Avoid race condition: only clear session if it's the current one
+			session = self.subscriber_sessions.get(subscriber_id)
+			if session and session.conn is conn:
+				self.subscriber_sessions.pop(subscriber_id, None)
+				self.online_status[subscriber_id] = {"online": False, "last_seen": time.time()}
 
 	def _mark_offline(self, subscriber_id: str) -> None:
 		with self._lock:
@@ -424,9 +449,12 @@ class BrokerServer:
 	def _send_json_raw(self, conn: socket.socket, payload: dict[str, Any]) -> bool:
 		data = (json.dumps(payload) + "\n").encode("utf-8")
 		try:
+			print(f"[BROKER] Sending: {payload}", flush=True)
 			conn.sendall(data)
+			print(f"[BROKER] Sent: {payload}", flush=True)
 			return True
-		except OSError:
+		except OSError as e:
+			print(f"[BROKER] Send failed: {e}", flush=True)
 			return False
 
 	def _send_json_session(self, session: ClientSession, payload: dict[str, Any]) -> bool:
@@ -440,16 +468,20 @@ class BrokerServer:
 
 
 def main() -> None:
-	broker = BrokerServer(host="127.0.0.1", port=9000)
-	broker.start()
-	print(f"Broker listening on {broker.host}:{broker.port}")
+	"""Run the broker server."""
+	server = BrokerServer(host="127.0.0.1", port=9000)
+	server.start()
+	print(f"Broker started on {server.host}:{server.port}")
+
 	try:
+		# Keep the main thread alive
 		while True:
 			time.sleep(1)
 	except KeyboardInterrupt:
-		pass
+		print("Broker shutting down...")
 	finally:
-		broker.stop()
+		server.stop()
+		print("Broker stopped.")
 
 
 if __name__ == "__main__":

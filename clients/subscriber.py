@@ -24,6 +24,13 @@ DEFAULT_PORT = 9000
 HEARTBEAT_INTERVAL = 2.0   # seconds — must be less than broker's heartbeat_timeout (5s)
 RECONNECT_DELAY = 3.0      # seconds to wait before reconnecting
 
+TOPIC_LABELS = {
+    "stocks.tech": "Tech Stocks",
+    "stocks.bank": "Banking",
+    "alerts.high": "High Priority Alerts",
+    "alerts.low": "Low Priority Alerts",
+}
+
 
 class Subscriber:
     """Connects to the broker, subscribes to topics, and receives messages.
@@ -53,6 +60,19 @@ class Subscriber:
         self._lock = threading.Lock()
         self._send_lock = threading.Lock()
 
+    def _print_banner(self) -> None:
+        topic_list = ", ".join(self.topics)
+        print()
+        print("╔" + "═" * 68 + "╗")
+        print("║" + f" SUBSCRIBER CONSOLE - {self.subscriber_id}".ljust(68) + "║")
+        print("║" + f" Broker: {self.host}:{self.port}".ljust(68) + "║")
+        print("║" + f" Topics: {topic_list}".ljust(68) + "║")
+        print("╚" + "═" * 68 + "╝")
+        print()
+
+    def _status(self, message: str) -> None:
+        print(f"[{self.subscriber_id}] [STATUS] {message}")
+
     # ── Connection ──────────────────────────────────────────────────────────
 
     def _connect(self) -> bool:
@@ -78,17 +98,17 @@ class Subscriber:
                     continue
 
                 if msg_type != "ok":
-                    print(f"[{self.subscriber_id}] Subscribe failed: {response}")
+                    self._status(f"Subscribe failed: {response}")
                     return False
 
                 break
 
-            print(f"[{self.subscriber_id}] Connected and subscribed to: {self.topics}")
+            self._status("Connected and subscription handshake complete.")
 
             return True
 
         except (ConnectionRefusedError, OSError) as e:
-            print(f"[{self.subscriber_id}] Connection failed: {e}")
+            self._status(f"Connection failed: {e}")
             return False
 
     def _disconnect(self) -> None:
@@ -133,8 +153,11 @@ class Subscriber:
 
     def _on_message(self, topic: str, payload: str, from_queue: bool = False) -> None:
         """Handle a delivered message. Override or extend this for custom logic."""
-        source = "QUEUE" if from_queue else "LIVE "
-        print(f"[{self.subscriber_id}] [{source}] topic={topic!r} payload={payload!r}")
+        source = "QUEUE" if from_queue else "LIVE"
+        channel_name = TOPIC_LABELS.get(topic, "Custom Channel")
+        print(f"[{self.subscriber_id}] [MESSAGE] {source} update received")
+        print(f"[{self.subscriber_id}] [CHANNEL] {channel_name} ({topic})")
+        print(f"[{self.subscriber_id}] [CONTENT] {payload}")
 
     def _handle_delivery(self, message: dict) -> None:
         topic = message.get("topic", "")
@@ -168,7 +191,7 @@ class Subscriber:
         """Receive messages from the broker. Auto-reconnects on disconnection."""
         while self._running.is_set():
             if self._sock is None:
-                print(f"[{self.subscriber_id}] Reconnecting in {RECONNECT_DELAY}s...")
+                self._status(f"Reconnecting in {RECONNECT_DELAY}s...")
                 time.sleep(RECONNECT_DELAY)
                 self._connect()
                 continue
@@ -177,7 +200,7 @@ class Subscriber:
                 message = self._recv()
             except (ConnectionError, OSError, json.JSONDecodeError) as e:
                 if self._running.is_set():
-                    print(f"[{self.subscriber_id}] Disconnected: {e}. Will reconnect...")
+                    self._status(f"Disconnected: {e}. Will reconnect...")
                     self._disconnect()
                 continue
 
@@ -187,7 +210,7 @@ class Subscriber:
                 self._handle_delivery(message)
 
             elif msg_type == "error":
-                print(f"[{self.subscriber_id}] Broker error: {message.get('message')}")
+                self._status(f"Broker error: {message.get('message')}")
 
             elif msg_type == "ok":
                 pass  # Heartbeat ack or other confirmations — ignore
@@ -197,10 +220,11 @@ class Subscriber:
     def start(self) -> None:
         """Connect to the broker and start listening in the background."""
         self._running.set()
+        self._print_banner()
 
         connected = self._connect()
         if not connected:
-            print(f"[{self.subscriber_id}] Initial connection failed. Will retry in background.")
+            self._status("Initial connection failed. Will retry in background.")
 
         self._heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
         self._heartbeat_thread.start()
@@ -214,7 +238,7 @@ class Subscriber:
         self._disconnect()
         if self._heartbeat_thread:
             self._heartbeat_thread.join(timeout=2)
-        print(f"[{self.subscriber_id}] Stopped.")
+        self._status("Stopped.")
 
 
 # ── CLI entry point ─────────────────────────────────────────────────────────
