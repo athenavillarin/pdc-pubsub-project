@@ -265,6 +265,17 @@ class BrokerServer:
 
 			self.online_status[subscriber_id] = {"online": True, "last_seen": time.time()}
 
+		# Flush queued messages for this subscriber before returning subscribe OK
+		queued_messages = self.queue.peek(subscriber_id)
+		for queued_msg in queued_messages:
+			self._send_to_subscriber(
+				subscriber_id,
+				queued_msg.topic,
+				queued_msg.payload,
+				message_id=queued_msg.message_id,
+				persisted=True,
+			)
+
 		return {
 			"type": "ok",
 			"cmd": "subscribe",
@@ -367,6 +378,18 @@ class BrokerServer:
 			if session and session.conn is conn:
 				self.subscriber_sessions.pop(subscriber_id, None)
 				self.online_status[subscriber_id] = {"online": False, "last_seen": time.time()}
+
+				# Enqueue any pending unacked live deliveries
+				pending_keys = [key for key in self.pending_acks if key[0] == subscriber_id]
+				for key in pending_keys:
+					pending = self.pending_acks.pop(key)
+					if not pending.persisted:
+						self.queue.enqueue(
+							subscriber_id,
+							pending.topic,
+							pending.payload,
+							message_id=pending.message_id,
+						)
 
 	def _mark_offline(self, subscriber_id: str) -> None:
 		with self._lock:
